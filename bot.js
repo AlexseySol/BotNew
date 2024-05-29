@@ -41,7 +41,7 @@ async function generateResponse(prompt, sessionMessages) {
         'Authorization': `Bearer ${OPENAI_API_KEY}`
       },
       body: JSON.stringify({
-        model: 'gpt-4o', // Указываем модель здесь
+        model: 'gpt-4o', // Указываем модель здесь!
         messages: messages,
         max_tokens: 1000,
         temperature: 0
