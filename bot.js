@@ -1,5 +1,7 @@
 require('dotenv').config();
-const { Telegraf, session } = require('telegraf');
+const { Telegraf, session, Markup } = require('telegraf');
+const fs = require('fs');
+const path = require('path');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
@@ -41,10 +43,10 @@ async function generateResponse(prompt, sessionMessages) {
         'Authorization': `Bearer ${OPENAI_API_KEY}`
       },
       body: JSON.stringify({
-        model: 'gpt-4o', // Указываем модель здесь!
+        model: 'gpt-4', // Указываем модель здесь!
         messages: messages,
         max_tokens: 1000,
-        temperature: 0
+        temperature: 0.7
       })
     });
 
@@ -65,9 +67,49 @@ async function generateResponse(prompt, sessionMessages) {
 // Добавляем объект для отслеживания обработанных сообщений
 const processedMessages = new Set();
 
+// Статусы для управления процессом сбора данных
+const steps = {
+  ASK_NAME: 'ASK_NAME',
+  ASK_PHONE: 'ASK_PHONE',
+  ASK_ADDRESS: 'ASK_ADDRESS',
+  DONE: 'DONE'
+};
+
+function saveUserData(userData) {
+  const filePath = path.join(__dirname, 'users.json');
+  let users = [];
+
+  // Читаем существующий файл users.json
+  if (fs.existsSync(filePath)) {
+    const fileData = fs.readFileSync(filePath);
+    users = JSON.parse(fileData);
+  }
+
+  // Добавляем новые данные пользователя
+  users.push(userData);
+
+  // Сохраняем обновленный массив в файл users.json
+  fs.writeFileSync(filePath, JSON.stringify(users, null, 2));
+}
+
+// Команда /start для начала диалога и показа кнопки "Сделать заказ"
+bot.start((ctx) => {
+  ctx.reply('Добро пожаловать! Начните общение или нажмите на кнопку ниже, чтобы сделать заказ.', Markup.inlineKeyboard([
+    Markup.button.callback('Сделать заказ', 'start_order')
+  ]));
+});
+
+// Обработчик нажатия кнопки "Сделать заказ"
+bot.action('start_order', async (ctx) => {
+  ctx.session.step = steps.ASK_NAME;
+  await ctx.reply('Как вас зовут?');
+});
+
+// Обработка текстовых сообщений для сбора данных и взаимодействия с OpenAI
 bot.on('text', async (ctx) => {
   const userMessage = ctx.message.text;
   const messageId = ctx.message.message_id;
+  const chatId = ctx.chat.id;
 
   console.log('Получено сообщение:', userMessage, 'ID сообщения:', messageId);
 
@@ -82,23 +124,81 @@ bot.on('text', async (ctx) => {
 
   // Инициализируем сессию, если она отсутствует
   if (!ctx.session) {
-    ctx.session = {};
-  }
-  if (!ctx.session.messages) {
-    ctx.session.messages = [];
+    ctx.session = { messages: [] };
   }
 
-  try {
-    const assistantResponse = await generateResponse(userMessage, ctx.session.messages);
-    console.log('Ответ помощника:', assistantResponse);
-    ctx.reply(assistantResponse);
+  // Проверка, находится ли пользователь в процессе заполнения заказа
+  if (ctx.session.step) {
+    const session = ctx.session;
 
-    // Сохраняем сообщение пользователя и ответ в сессию
+    try {
+      switch (session.step) {
+        case steps.ASK_NAME:
+          if (userMessage.split(' ').length >= 2) {
+            session.data = { name: userMessage };
+            session.step = steps.ASK_PHONE;
+            await ctx.reply('Отлично! Теперь введите ваш номер телефона.');
+          } else {
+            await ctx.reply('Пожалуйста, введите ваше полное имя (имя и фамилия).');
+          }
+          break;
+        case steps.ASK_PHONE:
+          if (/^\+?[0-9\s\-]+$/.test(userMessage)) {
+            session.data.phone = userMessage;
+            session.step = steps.ASK_ADDRESS;
+            await ctx.reply('Спасибо! Теперь введите ваш адрес.');
+          } else {
+            await ctx.reply('Пожалуйста, введите корректный номер телефона.');
+          }
+          break;
+        case steps.ASK_ADDRESS:
+          if (userMessage.split(' ').length >= 2) {
+            session.data.address = userMessage;
+            session.step = steps.DONE;
+            await ctx.reply(`Спасибо за информацию! Вот что мы собрали: \nФИО: ${session.data.name}\nНомер телефона: ${session.data.phone}\nАдрес: ${session.data.address}`);
+
+            // Сохранение данных в JSON файл
+            console.log('Сохранение данных пользователя:', session.data);
+            saveUserData({
+              chatId: chatId.toString(),
+              name: session.data.name,
+              phone: session.data.phone,
+              address: session.data.address
+            });
+
+            // Сброс сессии
+            session.step = null;
+          } else {
+            await ctx.reply('Пожалуйста, введите корректный адрес.');
+          }
+          break;
+        case steps.DONE:
+          await ctx.reply('Вы уже предоставили всю необходимую информацию. Спасибо!');
+          break;
+        default:
+          await ctx.reply('Что-то пошло не так. Попробуйте начать сначала с команды /start.');
+          session.step = null;
+      }
+    } catch (error) {
+      console.error('Ошибка при обработке шага:', error);
+      await ctx.reply('Произошла ошибка при обработке ваших данных. Попробуйте снова.');
+    }
+  } else {
+    // Генерация ответа через OpenAI
     ctx.session.messages.push({ role: 'user', content: userMessage });
-    ctx.session.messages.push({ role: 'assistant', content: assistantResponse });
-  } catch (error) {
-    console.error('Ошибка при обработке вашего запроса:', error);
-    ctx.reply('Произошла ошибка при обработке вашего запроса.');
+
+    try {
+      const assistantResponse = await generateResponse(userMessage, ctx.session.messages);
+      console.log('Ответ помощника:', assistantResponse);
+
+      ctx.session.messages.push({ role: 'assistant', content: assistantResponse });
+      await ctx.reply(assistantResponse, Markup.inlineKeyboard([
+        Markup.button.callback('Сделать заказ', 'start_order')
+      ]));
+    } catch (error) {
+      console.error('Ошибка при обработке запроса к OpenAI:', error);
+      await ctx.reply('Произошла ошибка при обработке вашего запроса.');
+    }
   }
 });
 
